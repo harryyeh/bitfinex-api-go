@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -16,7 +17,15 @@ import (
 	"crypto/sha512"
 	"encoding/hex"
 
-	"github.com/bitfinexcom/bitfinex-api-go/v2"
+	joonix "github.com/joonix/log"
+	log "github.com/sirupsen/logrus"
+
+	bitfinex "github.com/bitfinexcom/bitfinex-api-go/v2"
+)
+
+var (
+	vLogLevel  = os.Getenv("BF_LOG_LEVEL")
+	vLogFormat = os.Getenv("BF_LOG_FORMAT")
 )
 
 var productionBaseURL = "wss://api.bitfinex.com/ws/2"
@@ -91,7 +100,6 @@ func (w *WebsocketAsynchronousFactory) Create() Asynchronous {
 }
 
 // Client provides a unified interface for users to interact with the Bitfinex V2 Websocket API.
-// nolint:megacheck,structcheck
 type Client struct {
 	asyncFactory AsynchronousFactory // for re-creating transport during reconnects
 
@@ -135,13 +143,10 @@ func (c *Client) CancelOnDisconnect(cxl bool) *Client {
 	return c
 }
 
-func (c *Client) sign(msg string) (string, error) {
+func (c *Client) sign(msg string) string {
 	sig := hmac.New(sha512.New384, []byte(c.apiSecret))
-	_, err := sig.Write([]byte(msg))
-	if err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(sig.Sum(nil)), nil
+	sig.Write([]byte(msg))
+	return hex.EncodeToString(sig.Sum(nil))
 }
 
 func (c *Client) registerFactory(channel string, factory messageFactory) {
@@ -214,7 +219,7 @@ func extractSymbolResolutionFromKey(subscription string) (symbol string, resolut
 func (c *Client) registerPublicFactories() {
 	c.registerFactory(ChanTicker, newTickerFactory(c.subscriptions))
 	c.registerFactory(ChanTrades, newTradeFactory(c.subscriptions))
-	c.registerFactory(ChanBook, newBookFactory(c.subscriptions, c.orderbooks, c.parameters.ManageOrderbook))
+	c.registerFactory(ChanBook, newBookFactory(c.subscriptions, c.orderbooks))
 	c.registerFactory(ChanCandles, newCandlesFactory(c.subscriptions))
 }
 
@@ -227,24 +232,18 @@ func (c *Client) listenDisconnect() {
 	select {
 	case e := <-c.asynchronous.Done(): // transport shutdown
 		if e != nil {
-			log.Printf("socket disconnect: %s", e.Error())
+			log.Infof("socket disconnect: %s", e.Error())
 		}
 		c.isConnected = false
-		err := c.reconnect(e)
-		if err != nil {
-			log.Printf("socket disconnect: %s", err.Error())
-		}
+		c.reconnect(e)
 	case e := <-c.subscriptions.ListenDisconnect(): // subscription heartbeat timeout
 		if e != nil {
-			log.Printf("heartbeat disconnect: %s", e.Error())
+			log.Infof("heartbeat disconnect: %s", e.Error())
 		}
 		c.isConnected = false
 		if e != nil {
 			c.closeAsyncAndWait(c.parameters.ShutdownTimeout)
-			err := c.reconnect(e)
-			if err != nil {
-				log.Printf("socket disconnect: %s", err.Error())
-			}
+			c.reconnect(e)
 		}
 	case <-c.shutdown: // normal shutdown
 		c.isConnected = false
@@ -252,15 +251,15 @@ func (c *Client) listenDisconnect() {
 }
 
 func (c *Client) dumpParams() {
-	log.Print("----Bitfinex Client Parameters----")
-	log.Printf("AutoReconnect=%t", c.parameters.AutoReconnect)
-	log.Printf("ReconnectInterval=%s", c.parameters.ReconnectInterval)
-	log.Printf("ReconnectAttempts=%d", c.parameters.ReconnectAttempts)
-	log.Printf("ShutdownTimeout=%s", c.parameters.ShutdownTimeout)
-	log.Printf("ResubscribeOnReconnect=%t", c.parameters.ResubscribeOnReconnect)
-	log.Printf("HeartbeatTimeout=%s", c.parameters.HeartbeatTimeout)
-	log.Printf("URL=%s", c.parameters.URL)
-	log.Printf("ManageOrderbook=%t", c.parameters.ManageOrderbook)
+	log.Infof("----Bitfinex Client Parameters----")
+	log.Infof("AutoReconnect=%t", c.parameters.AutoReconnect)
+	log.Infof("ReconnectInterval=%s", c.parameters.ReconnectInterval)
+	log.Infof("ReconnectAttempts=%d", c.parameters.ReconnectAttempts)
+	log.Infof("ShutdownTimeout=%s", c.parameters.ShutdownTimeout)
+	log.Infof("ResubscribeOnReconnect=%t", c.parameters.ResubscribeOnReconnect)
+	log.Infof("HeartbeatTimeout=%s", c.parameters.HeartbeatTimeout)
+	log.Infof("URL=%s", c.parameters.URL)
+	log.Infof("ManageOrderbook=%t", c.parameters.ManageOrderbook)
 }
 
 // Connect to the Bitfinex API, this should only be called once.
@@ -286,42 +285,34 @@ func (c *Client) reset() {
 }
 
 func (c *Client) connect() error {
+	// Set the Log Level for Websockets
+	setLogLevel()
 	err := c.asynchronous.Connect()
 	if err == nil {
 		c.isConnected = true
 	}
 	// enable flag
 	if c.parameters.ManageOrderbook {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-		defer cancel()
-		_, err_flag := c.EnableFlag(ctx, bitfinex.Checksum)
-		if err_flag != nil {
-			return err_flag
-		}
+		ctx, _ := context.WithTimeout(context.Background(), time.Second*5)
+		c.EnableFlag(ctx, bitfinex.Checksum)
 	}
 	return err
 }
 
 func (c *Client) reconnect(err error) error {
 	if c.terminal {
-		err_exit := c.exit(err)
-		if err_exit != nil {
-			return err_exit
-		}
+		c.exit(err)
 		return err
 	}
 	if !c.parameters.AutoReconnect {
 		err := fmt.Errorf("AutoReconnect setting is disabled, do not reconnect: %s", err.Error())
-		err_exit := c.exit(err)
-		if err_exit != nil {
-			return err_exit
-		}
+		c.exit(err)
 		return err
 	}
 	for ; c.parameters.reconnectTry < c.parameters.ReconnectAttempts; c.parameters.reconnectTry++ {
-		log.Printf("waiting %s until reconnect...", c.parameters.ReconnectInterval)
+		log.Infof("waiting %s until reconnect...", c.parameters.ReconnectInterval)
 		time.Sleep(c.parameters.ReconnectInterval)
-		log.Printf("reconnect attempt %d/%d", c.parameters.reconnectTry+1, c.parameters.ReconnectAttempts)
+		log.Infof("reconnect attempt %d/%d", c.parameters.reconnectTry+1, c.parameters.ReconnectAttempts)
 		c.reset()
 		err = c.connect()
 		if err == nil {
@@ -329,10 +320,10 @@ func (c *Client) reconnect(err error) error {
 			c.parameters.reconnectTry = 0
 			return nil
 		}
-		log.Printf("reconnect failed: %s", err.Error())
+		log.Infof("reconnect failed: %s", err.Error())
 	}
 	if err != nil {
-		log.Printf("could not reconnect: %s", err.Error())
+		log.Infof("could not reconnect: %s", err.Error())
 	}
 	return c.exit(err)
 }
@@ -352,10 +343,10 @@ func (c *Client) listenUpstream() {
 		case msg := <-c.asynchronous.Listen():
 			if msg != nil {
 				// Errors here should be non critical so we just log them.
-				log.Printf("[DEBUG]: %s\n", msg)
+				log.Debugf("[DEBUG]: %s\n", msg)
 				err := c.handleMessage(msg)
 				if err != nil {
-					log.Printf("[WARN]: %s\n", err)
+					log.Warnf("[WARN]: %s\n", err)
 				}
 			}
 		}
@@ -452,26 +443,22 @@ func (c *Client) checkResubscription() {
 				continue
 			}
 			sub.Request.SubID = c.nonce.GetNonce() // new nonce
-			log.Printf("resubscribing to %s with nonce %s", sub.Request.String(), sub.Request.SubID)
+			log.Infof("resubscribing to %s with nonce %s", sub.Request.String(), sub.Request.SubID)
 			_, err := c.Subscribe(context.Background(), sub.Request)
 			if err != nil {
-				log.Printf("could not resubscribe: %s", err.Error())
+				log.Infof("could not resubscribe: %s", err.Error())
 			}
 		}
 	}
 }
 
 // called when an info event is received
-func (c *Client) handleOpen() (error) {
+func (c *Client) handleOpen() {
 	if c.hasCredentials() {
-		err_auth := c.authenticate(context.Background())
-		if err_auth != nil {
-			return err_auth
-		}
+		c.authenticate(context.Background())
 	} else {
 		c.checkResubscription()
 	}
-	return nil
 }
 
 // called when an auth event is received
@@ -479,7 +466,7 @@ func (c *Client) handleAuthAck(auth *AuthEvent) {
 	if c.Authentication == SuccessfulAuthentication {
 		err := c.subscriptions.activate(auth.SubID, auth.ChanID)
 		if err != nil {
-			log.Printf("could not activate auth subscription: %s", err.Error())
+			log.Infof("could not activate auth subscription: %s", err.Error())
 		}
 		c.checkResubscription()
 	} else {
@@ -506,15 +493,12 @@ func (c *Client) Unsubscribe(ctx context.Context, id string) error {
 // only subscribe to the filtered messages.
 func (c *Client) authenticate(ctx context.Context, filter ...string) error {
 	nonce := c.nonce.GetNonce()
+
 	payload := "AUTH" + nonce
-	sig, err := c.sign(payload)
-	if err != nil {
-		return err
-	}
 	s := &SubscriptionRequest{
 		Event:       "auth",
 		APIKey:      c.apiKey,
-		AuthSig:     sig,
+		AuthSig:     c.sign(payload),
 		AuthPayload: payload,
 		AuthNonce:   nonce,
 		Filter:      filter,
@@ -531,4 +515,50 @@ func (c *Client) authenticate(ctx context.Context, filter ...string) error {
 	c.Authentication = PendingAuthentication
 
 	return nil
+}
+
+func setLogLevel() {
+	// Log as JSON instead of the default ASCII formatter.
+	if strings.ToLower(vLogFormat) == "json" {
+		log.SetFormatter(&log.JSONFormatter{})
+	}
+	if strings.ToLower(vLogFormat) == "fluentd" {
+		log.SetFormatter(&joonix.FluentdFormatter{})
+	}
+	// Output to stdout instead of the default stderr
+	// Can be any io.Writer, see below for File example
+	log.SetOutput(os.Stdout)
+
+	// Only log the warning severity or above.
+	log.SetLevel(log.WarnLevel)
+	switch strings.ToLower(vLogLevel) {
+	case "trace":
+		log.SetLevel(log.TraceLevel)
+		break
+
+	case "debug":
+		log.SetLevel(log.DebugLevel)
+		break
+
+	// Skip Info since it's the default
+
+	case "info":
+		log.SetLevel(log.InfoLevel)
+		break
+
+	case "error":
+		log.SetLevel(log.ErrorLevel)
+		break
+
+	case "fatal":
+		log.SetLevel(log.FatalLevel)
+		break
+
+	case "panic":
+		log.SetLevel(log.PanicLevel)
+		break
+
+	default:
+		log.SetLevel(log.WarnLevel)
+	}
 }

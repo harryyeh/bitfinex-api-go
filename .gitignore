@@ -1,0 +1,9 @@
+.vendor/*
+bin
+bin/*
+.godeps/*
+pkg/*
+vendor/*
+*sublime-workspace
+index.html
+coverage/*
